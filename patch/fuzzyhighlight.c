@@ -11,7 +11,7 @@ drawhighlights(struct item *item, int x, int y, int maxw)
 		return;
 
 	/* Do not highlight items scheduled for output */
-	if (item->out)
+	if (issel(item->id))
 		return;
 
 	drw_setscheme(drw, scheme[item == sel

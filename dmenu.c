@@ -17,6 +17,9 @@
 #include <X11/Xft/Xft.h>
 
 /* Patch incompatibility overrides */
+#undef NON_BLOCKING_STDIN_PATCH
+#undef PIPEOUT_PATCH
+#undef PRINTINPUTTEXT_PATCH
 
 #include "drw.h"
 #include "util.h"
@@ -41,7 +44,7 @@ enum {
 struct item {
 	char *text;
 	struct item *left, *right;
-	int out;
+	int id; /* for multiselect */
 	double distance;
 };
 
@@ -59,6 +62,8 @@ static struct item *items = NULL;
 static struct item *matches, *matchend;
 static struct item *prev, *curr, *next, *sel;
 static int mon = -1, screen;
+static int *selid = NULL;
+static unsigned int selidsize = 0;
 
 static Atom clip, utf8;
 static Display *dpy;
@@ -153,6 +158,7 @@ cleanup(void)
 	drw_free(drw);
 	XSync(dpy, False);
 	XCloseDisplay(dpy);
+	free(selid);
 }
 
 static char *
@@ -174,7 +180,7 @@ drawitem(struct item *item, int x, int y, int w)
 
 	if (item == sel)
 		drw_setscheme(drw, scheme[SchemeSel]);
-	else if (item->out)
+	else if (issel(item->id))
 		drw_setscheme(drw, scheme[SchemeOut]);
 	else
 		drw_setscheme(drw, scheme[SchemeNorm]);
@@ -447,48 +453,48 @@ keypress(XKeyEvent *ev)
 
 	if (ev->state & ControlMask) {
 		switch(ksym) {
-		case XK_a: expect("ctrl-a", ev); ksym = XK_Home;      break;
-		case XK_c: expect("ctrl-c", ev); ksym = XK_Escape;    break;
-		case XK_d: expect("ctrl-d", ev); ksym = XK_Delete;    break;
-		case XK_e: expect("ctrl-e", ev); ksym = XK_End;       break;
-		case XK_g: expect("ctrl-g", ev); ksym = XK_Escape;    break;
-		case XK_h: expect("ctrl-h", ev); ksym = XK_Left;      break;
-		case XK_i: expect("ctrl-i", ev); ksym = XK_Tab;       break;
-		case XK_j: expect("ctrl-j", ev); ksym = XK_Down;      break;
-		case XK_J:/* fallthrough */
-		case XK_l: expect("ctrl-l", ev); ksym = XK_Right;     break;
-		case XK_m: expect("ctrl-m", ev); /* fallthrough */
+		case XK_a: ksym = XK_Home;      break;
+		case XK_b: ksym = XK_Prior;      break;
+		case XK_c: ksym = XK_Escape;    break;
+		case XK_d: ksym = XK_Delete;    break;
+		case XK_e: ksym = XK_End;       break;
+		case XK_f: ksym = XK_Next;     break;
+		case XK_g: ksym = XK_Home;    break;
+		case XK_G: ksym = XK_End;    break;
+		case XK_h: ksym = XK_Left; break;
+		case XK_l: ksym = XK_Right; break;
+		case XK_i: ksym = XK_Tab;       break;
+		case XK_j: ksym = XK_Down;      break;
+		case XK_k: ksym = XK_Up;      break;
+		case XK_J: /* fallthrough */
+		case XK_m: /* fallthrough */
 		case XK_M: ksym = XK_Return; ev->state &= ~ControlMask; break;
-		case XK_n: expect("ctrl-n", ev); ksym = XK_Down; break;
-		case XK_p: expect("ctrl-p", ev); ksym = XK_Up;   break;
-		case XK_o: expect("ctrl-o", ev); break;
-		case XK_q: expect("ctrl-q", ev); break;
-		case XK_r: expect("ctrl-r", ev); break;
-		case XK_s: expect("ctrl-s", ev); break;
-		case XK_t: expect("ctrl-t", ev); break;
-		case XK_k: expect("ctrl-k", ev); ksym = XK_Up; break;
-		case XK_u: expect("ctrl-u", ev); /* delete left */
+		case XK_n: ksym = XK_Down;      break;
+		case XK_p: ksym = XK_Up;        break;
+
+		// case XK_k: /* delete right */
+		// 	text[cursor] = '\0';
+		// 	match();
+		// 	break;
+		case XK_u: /* delete left */
 			insert(NULL, 0 - cursor);
 			break;
-		case XK_w: expect("ctrl-w", ev); /* delete word */
+		case XK_w: /* delete word */
 			while (cursor > 0 && strchr(worddelimiters, text[nextrune(-1)]))
 				insert(NULL, nextrune(-1) - cursor);
 			while (cursor > 0 && !strchr(worddelimiters, text[nextrune(-1)]))
 				insert(NULL, nextrune(-1) - cursor);
 			break;
 		case XK_v:
-			expect("ctrl-v", ev);
 		case XK_V:
 			XConvertSelection(dpy, (ev->state & ShiftMask) ? clip : XA_PRIMARY,
 			                  utf8, utf8, win, CurrentTime);
 			return;
-		case XK_y: expect("ctrl-y", ev); /* paste selection */
+		case XK_y: /* paste selection */
 		case XK_Y:
 			XConvertSelection(dpy, (ev->state & ShiftMask) ? clip : XA_PRIMARY,
 			                  utf8, utf8, win, CurrentTime);
 			return;
-		case XK_x: expect("ctrl-x", ev); break;
-		case XK_z: expect("ctrl-z", ev); break;
 		case XK_Left:
 		case XK_KP_Left:
 			movewordedge(-1);
@@ -499,6 +505,7 @@ keypress(XKeyEvent *ev)
 			goto draw;
 		case XK_Return:
 		case XK_KP_Enter:
+			selsel();
 			break;
 		case XK_bracketleft:
 			cleanup();
@@ -508,18 +515,6 @@ keypress(XKeyEvent *ev)
 		}
 	} else if (ev->state & Mod1Mask) {
 		switch(ksym) {
-		case XK_b:
-			movewordedge(-1);
-			goto draw;
-		case XK_f:
-			movewordedge(+1);
-			goto draw;
-		case XK_g: ksym = XK_Home;  break;
-		case XK_G: ksym = XK_End;   break;
-		case XK_h: ksym = XK_Up;    break;
-		case XK_j: ksym = XK_Next;  break;
-		case XK_k: ksym = XK_Prior; break;
-		case XK_l: ksym = XK_Down;  break;
 		case XK_p:
 			navhistory(-1);
 			buf[0]=0;
@@ -629,15 +624,13 @@ insert:
 		break;
 	case XK_Return:
 	case XK_KP_Enter:
-		puts((sel && !(ev->state & ShiftMask)) ? sel->text : text);
 		if (!(ev->state & ControlMask)) {
 			savehistory((sel && !(ev->state & ShiftMask))
 				    ? sel->text : text);
+			printsel(ev->state);
 			cleanup();
 			exit(0);
 		}
-		if (sel)
-			sel->out = 1;
 		break;
 	case XK_Right:
 	case XK_KP_Right:
@@ -730,7 +723,7 @@ readstdin(void)
 
 		if (!(items[i].text = strdup(line)))
 			die("strdup:");
-		items[i].out = 0;
+		items[i].id = i; /* for multiselect */
 
 	}
 	free(line);
@@ -915,7 +908,6 @@ usage(void)
 		"[-l lines] [-p prompt] [-fn font] [-m monitor]"
 		"\n             [-nb color] [-nf color] [-sb color] [-sf color] [-w windowid]"
 		"\n            "
-		" [-ex expectkey]"
 		" [-bw width]"
 		"\n            "
 		" [-H histfile]"
@@ -969,10 +961,9 @@ main(int argc, char *argv[])
 		} else if (!strcmp(argv[i], "-x")) { /* adds border padding */
 			isborderpadding = 1;
 			border_width = 0;
+			center = 0;
 		} else if (!strcmp(argv[i], "-wi")) { /* adds border padding */
 			width = atoi(argv[++i]);
-		} else if (!strcmp(argv[i], "-ex")) { /* expect key */
-			expected = argv[++i];
 		} else if (i + 1 == argc)
 			usage();
 		/* these options take one argument */
